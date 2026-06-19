@@ -28,6 +28,8 @@ export function registerCodeMode(
 
     const executeTool = createExecuteTool({
         prefix: "loinc",
+        // Verifiable provenance: loinc_execute results carry a _meta.citation.
+        source: { id: "loinc", name: "LOINC", url: "https://loinc.org" },
         catalog: loincCatalog,
         apiFetch,
         doNamespace: env.LOINC_DATA_DO,
