@@ -46,7 +46,7 @@ assertContains('src/tools/code-mode.ts', codeModeContent, 'LOINC_DATA_DO', 'code
 // Index
 const indexContent = readFile('src/index.ts');
 assertContains('src/index.ts', indexContent, 'LoincDataDO', 'index.ts exports LoincDataDO');
-assertContains('src/index.ts', indexContent, 'McpAgent', 'index.ts uses McpAgent');
+assertContains('src/index.ts', indexContent, 'StatelessMcpWorker', 'index.ts uses StatelessMcpWorker');
 assertContains('src/index.ts', indexContent, 'registerCodeMode', 'index.ts registers Code Mode');
 assertContains('src/index.ts', indexContent, 'registerQueryData', 'index.ts registers query-data');
 assertContains('src/index.ts', indexContent, 'registerGetSchema', 'index.ts registers get-schema');
