@@ -54,10 +54,12 @@
 	"observability": {
 		"enabled": true
 	},
-	"vars": {
-		"LOINC_USERNAME": "",
-		"LOINC_PASSWORD": ""
-	},
+	// LOINC_USERNAME / LOINC_PASSWORD are Worker SECRETS, not vars — declaring
+	// them here as "" made an unset credential read as an empty string, which is
+	// indistinguishable from a real one at a glance. Unset now means undefined.
+	// LOINC_BASE_URL is an optional var that pins one FHIR base (disables failover).
+	//   npx wrangler secret put LOINC_USERNAME --name loinc-mcp-server
+	//   npx wrangler secret put LOINC_PASSWORD --name loinc-mcp-server
 	"dev": {
 		"port": 8874
 	}

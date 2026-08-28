@@ -11,8 +11,9 @@ export { LoincDataDO };
 interface LoincEnv {
     LOINC_DATA_DO: DurableObjectNamespace;
     CODE_MODE_LOADER: WorkerLoader;
-    LOINC_USERNAME: string;
-    LOINC_PASSWORD: string;
+    LOINC_USERNAME?: string;
+    LOINC_PASSWORD?: string;
+    LOINC_BASE_URL?: string;
 }
 
 export class MyMCP extends StatelessMcpWorker {
