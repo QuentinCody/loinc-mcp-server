@@ -1,88 +1,56 @@
 import type { ApiFetchFn } from "@bio-mcp/shared/codemode/catalog";
-import { type LoincEndpoint, loincFetch, resolveLoincEndpoints } from "./http";
+import { type LoincEndpoint, loincFetch, LoincTier, resolveLoincEndpoints } from "./http";
+import { loincRequest } from "./request";
+import { fail, object, readText } from "./response";
+import { validateVersionInputs, verifyFhirShape, verifyVersions } from "./versioning";
 
-interface LoincAdapterOptions {
-    /** Pre-resolved endpoints; defaults to the keyless tier */
-    endpoints?: LoincEndpoint[];
-}
-
-/** The LOINC release the answering server reports, when it reports one. */
-function extractLoincVersion(data: Record<string, unknown>): string | undefined {
-    if (data.resourceType === "Parameters" && Array.isArray(data.parameter)) {
-        for (const entry of data.parameter as Array<Record<string, unknown>>) {
-            if (entry?.name === "version" && typeof entry.valueString === "string") {
-                return entry.valueString;
-            }
-        }
-    }
-    // CodeSystem / ValueSet resources carry the release on the resource itself
-    if (typeof data.version === "string") return data.version;
-    return undefined;
-}
-
-/**
- * Stamp the answering upstream onto the FHIR resource, so a caller can never
- * mistake the keyless mirror for the licensed Regenstrief server or read a
- * LOINC release that is not the one it got. Purely additive — `parameter`,
- * `expansion` and `entry` reach the isolate untouched.
- */
-function stampTier(data: unknown, endpoint: LoincEndpoint): unknown {
-    if (!data || typeof data !== "object" || Array.isArray(data)) return data;
-    const resource = data as Record<string, unknown>;
-    const existing =
-        resource._meta && typeof resource._meta === "object" && !Array.isArray(resource._meta)
-            ? (resource._meta as Record<string, unknown>)
-            : {};
-    const version = extractLoincVersion(resource);
-    return {
-        ...resource,
-        _meta: {
-            ...existing,
-            loinc_tier: endpoint.tier,
-            loinc_base_url: endpoint.baseUrl,
-            ...(version ? { loinc_version: version } : {}),
-        },
-    };
-}
+interface LoincAdapterOptions { endpoints?: LoincEndpoint[] }
 
 export function createLoincApiFetch(opts?: LoincAdapterOptions): ApiFetchFn {
-    const endpoints = opts?.endpoints ?? resolveLoincEndpoints();
+  const endpoints = opts?.endpoints ?? resolveLoincEndpoints();
+  return async request => {
+    const method = request.method.toUpperCase();
+    if (method !== "GET" || request.body !== undefined) fail("This LOINC catalog supports GET reads without a body", 405);
+    const normalized = loincRequest(request.path, request.params, endpoints);
+    const { path, params } = normalized;
+    validateVersionInputs(path, params);
+    const { response, endpoint } = await loincFetch(path, params, { endpoints: normalized.endpoints });
+    let text: string;
+    try { text = await readText(response); }
+    catch (error) {
+      const failure = error as Error & { status?: number; data?: unknown };
+      fail(failure.message, failure.status ?? 502, { loinc_tier: endpoint.tier, loinc_base_url: endpoint.baseUrl, path, params, body_error: failure.data });
+    }
+    const evidence = { response: text, http_status: response.status, content_type: response.headers.get("content-type"), loinc_tier: endpoint.tier, loinc_base_url: endpoint.baseUrl, path, params };
+    if (!response.ok) fail(`HTTP ${response.status} from ${endpoint.tier}`, response.status, evidence);
+    let resource: Record<string, unknown>;
+    try { resource = object(JSON.parse(text)); }
+    catch { fail(`Non-JSON FHIR response from ${endpoint.tier}`, 502, evidence); }
+    if (typeof resource.resourceType !== "string") fail(`Missing FHIR resource type from ${endpoint.tier}`, 502, evidence);
+    if (resource.resourceType === "OperationOutcome") fail(`FHIR OperationOutcome from ${endpoint.tier}`, 502, { ...evidence, resource });
+    return buildVersionedResource(resource, path, params, evidence, response, endpoint);
+  };
+}
 
-    return async (request) => {
-        const path = request.path;
-
-        const { response, endpoint } = await loincFetch(path, request.params, {
-            endpoints,
-        });
-
-        if (!response.ok) {
-            let errorBody: string;
-            try {
-                errorBody = await response.text();
-            } catch {
-                errorBody = response.statusText;
-            }
-            // Name the tier in the message: a 401 from fhir.loinc.org means a
-            // missing/rejected credential, a 404 from a keyless mirror means the
-            // code genuinely is not in the release it serves.
-            const error = new Error(
-                `HTTP ${response.status} from ${endpoint.tier}: ${errorBody.slice(0, 200)}`,
-            ) as Error & {
-                status: number;
-                data: unknown;
-            };
-            error.status = response.status;
-            error.data = errorBody;
-            throw error;
-        }
-
-        const contentType = response.headers.get("content-type") || "";
-        if (!contentType.includes("json") && !contentType.includes("fhir")) {
-            const text = await response.text();
-            return { status: response.status, data: text };
-        }
-
-        const data = await response.json();
-        return { status: response.status, data: stampTier(data, endpoint) };
-    };
+function buildVersionedResource(resource: Record<string, unknown>, path: string, params: { [x: string]: unknown; }, evidence: { response: string; http_status: number; content_type: string | null; loinc_tier: LoincTier; loinc_base_url: string; path: string; params: { [x: string]: unknown; }; }, response: Response, endpoint: LoincEndpoint) : Awaited<ReturnType<ApiFetchFn>> {
+  let versions: string[];
+  try { versions = verifyVersions(resource, path, params); verifyFhirShape(resource, path); }
+  catch (error) {
+    const failure = error as Error & { status?: number; data?: unknown; };
+    fail(failure.message, failure.status ?? 502, { ...evidence, resource, verification: failure.data });
+  }
+  const existing = resource._meta && typeof resource._meta === "object" && !Array.isArray(resource._meta) ? resource._meta as Record<string, unknown> : {};
+  return {
+    status: response.status, data: {
+      ...resource, _meta: {
+        ...Object.fromEntries(Object.entries(existing).filter(([key]) => !["loinc_version", "loinc_versions", "resource_version"].includes(key))), loinc_tier: endpoint.tier, loinc_base_url: endpoint.baseUrl,
+        ...(versions.length === 1 ? { loinc_version: versions[0] } : versions.length > 1 ? { loinc_versions: versions } : {}),
+        ...(["ValueSet", "ConceptMap", "Questionnaire"].includes(String(resource.resourceType)) && typeof resource.version === "string" ? { resource_version: resource.version } : {}),
+        ...(Object.keys(params).some(key => ["version", "valueSetVersion", "system-version", "check-system-version"].includes(key)) ? {
+          requested_versions: { version: params.version, valueSetVersion: params.valueSetVersion, "system-version": params["system-version"], "check-system-version": params["check-system-version"] },
+          version_note: "Requested versions are not observed releases. Lookup/resource pins are checked against returned versions. Empty search results do not establish availability. ValueSet/ConceptMap/Questionnaire versions are distinct from code-system versions.",
+        } : {}),
+      }
+    }
+  };
 }

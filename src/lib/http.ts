@@ -1,5 +1,5 @@
-import { restFetch } from "@bio-mcp/shared/http/rest-fetch";
 import type { RestFetchOptions } from "@bio-mcp/shared/http/rest-fetch";
+import { restFetch } from "@bio-mcp/shared/http/rest-fetch";
 
 /**
  * Licensed tier — Regenstrief's own FHIR server. It sits behind an Authelia
@@ -169,10 +169,9 @@ export function loincSourceDescriptor(
  * order and reporting which one answered.
  *
  * Failover is deliberately narrow: a transport error or a 5xx means that host
- * is down, so the next one gets the request. Every 4xx is a real FHIR answer —
- * notably the 404 OperationOutcome for an unknown code, and the 401 the
- * licensed tier returns without a credential — and is returned unchanged from
- * the endpoint that produced it.
+ * may be unavailable, so the next one gets the request. Every 4xx stays with
+ * the answering host, including unsupported versions/resources and rejected
+ * credentials. A 404 does not prove that a code is absent in every release.
  */
 export async function loincFetch(
     path: string,
@@ -184,8 +183,7 @@ export async function loincFetch(
         throw new Error("loincFetch: no LOINC endpoint resolved");
     }
 
-    // With a failover candidate behind it, each endpoint gets a fraction of the
-    // isolate's 30s execution budget so the second one still gets a turn. A
+    // Each failover candidate gets a bounded attempt budget. A
     // single pinned endpoint keeps the original 30s.
     const hasFailover = endpoints.length > 1;
     const attemptTimeout = opts?.timeout ?? (hasFailover ? 10_000 : 30_000);
@@ -220,6 +218,7 @@ export async function loincFetch(
             });
 
             if (response.status >= 500 && !isLast) {
+                void response.body?.cancel().catch(() => undefined);
                 lastError = new Error(
                     `${endpoint.baseUrl} returned HTTP ${response.status}`,
                 );

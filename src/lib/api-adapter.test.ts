@@ -56,7 +56,7 @@ describe("createLoincApiFetch (tier provenance on every result)", () => {
     });
 
     it("reports the licensed tier when credentials are configured", async () => {
-        stubFetch(200, { resourceType: "CodeSystem", version: "2.83" });
+        stubFetch(200, { resourceType: "CodeSystem", url: "http://loinc.org", version: "2.83" });
         const apiFetch = createLoincApiFetch({
             endpoints: resolveLoincEndpoints({ username: "u", password: "p" }),
         });

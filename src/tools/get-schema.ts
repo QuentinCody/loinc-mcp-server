@@ -1,6 +1,7 @@
 import type { McpServer } from "@bio-mcp/shared/mcp";
-import { z } from "zod";
 import { createGetSchemaHandler } from "@bio-mcp/shared/staging/utils";
+import { z } from "zod";
+import { loincResponse } from "../lib/tool-result";
 
 interface SchemaEnv {
     LOINC_DATA_DO?: unknown;
@@ -9,8 +10,8 @@ interface SchemaEnv {
 export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
     const handler = createGetSchemaHandler("LOINC_DATA_DO", "loinc");
 
-    server.registerTool(
-        "loinc_get_schema",
+    for (const name of ["loinc_get_schema", "mcp_loinc_get_schema"]) server.registerTool(
+        name,
         {
             title: "Get Staged Data Schema",
             description:
@@ -24,11 +25,11 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
         },
         async (args, extra) => {
             const runtimeEnv = env || (extra as { env?: SchemaEnv })?.env || {};
-            return handler(
+            return loincResponse(() => handler(
                 args as Record<string, unknown>,
                 runtimeEnv as Record<string, unknown>,
                 (extra as Record<string, unknown>),
-            );
+            ), runtimeEnv, name, extra, args);
         },
     );
 }

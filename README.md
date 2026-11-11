@@ -38,7 +38,7 @@ For local development the server runs at `http://localhost:8874/mcp` (start it w
 
 ## Tools
 
-- `loinc_search` — discover available API operations (Code Mode catalog search, 9 endpoints)
+- `loinc_search` — discover available API operations and release-selection recipes (Code Mode catalog search)
 - `loinc_execute` — **Code Mode**: write JavaScript in a V8 isolate (`api.get()` / `api.post()` / `searchSpec()`) instead of issuing tool calls one by one
 - `loinc_query_data` — run SQL over large responses auto-staged into a per-session SQLite database
 - `loinc_get_schema` — inspect the inferred schema of a staged dataset
@@ -61,9 +61,93 @@ resolved at startup from the environment, and every result carries
 | `licensed:fhir.loinc.org` | `https://fhir.loinc.org` | `LOINC_USERNAME` **and** `LOINC_PASSWORD` are both set. |
 | `override` | `LOINC_BASE_URL` | An explicit base is pinned. Failover is disabled. |
 
-Failover happens only on a transport error or a 5xx. A 4xx is a real answer — a
-404 `OperationOutcome` means the code is not in the release the server carries —
-and reaches the caller unchanged from the endpoint that produced it.
+Failover happens only on a transport error or a 5xx. A 4xx keeps its answering
+host and HTTP status. Read its diagnostics: a 404 can indicate an unsupported
+version or resource, so it does not by itself establish code absence.
+
+Each catalog request also accepts `upstream: "primary"`, `"tx.fhir.org"` or
+`"ontoserver"`. This local selector chooses one endpoint from the configured set
+and disables failover for that request. It cannot escape a licensed or override
+configuration, and it is never sent to the upstream API. For example:
+
+```js
+return await api.get("/CodeSystem/$lookup", {
+  upstream: "ontoserver", system: "http://loinc.org", code: "2160-0",
+  version: "2.83", property: "*"
+});
+```
+
+Use the catalog path and a separate parameter object. The shared Code Mode
+dispatcher rejects query-bearing paths before they reach the adapter.
+
+### Release selection and Questionnaires
+
+LOINC announced [2.83 on August 19, 2026](https://loinc.org/news/loinc-version-2-83-release-highlights).
+The [provider service update of August 27](https://loinc.org/kb/api/fhir)
+changed ConceptMap/ValueSet version selection and added historical Questionnaires.
+The catalog exposes the native selectors and recipes:
+
+| Read | Selector | Verification |
+| --- | --- | --- |
+| `CodeSystem/$lookup` | `version: "2.83"` | Returned Parameters must establish exactly the requested LOINC version. |
+| `CodeSystem/$validate-code` | `url: "http://loinc.org"`, `code`, optional `version` | A pin requires positive validation and the same returned release. Legacy `system` is normalized to `url`; conflicting values fail locally. |
+| `CodeSystem`, `ConceptMap`, `Questionnaire` search | canonical `url` plus `version` | Each returned resource must match both selectors. |
+| `ValueSet/$expand` | `url` plus `valueSetVersion` | Returned ValueSet definition version must match. |
+| `ValueSet/$expand` | `check-system-version: "http://loinc.org\|2.83"` | Native expansion evidence must establish the underlying CodeSystem release. `system-version` receives the same strict verification here; a request echo is insufficient. |
+| `Questionnaire/{id}` | Provider resource ID | Retains the provider's resource version; use search for historical selection. |
+
+An empty search is not proof of version availability. A host that ignores a pin
+or omits the required version produces an error rather than an unverified result.
+Version selection survives keyless failover. Native checks on October 4, 2026
+established 2.83 and pinned 2.82 lookup/validation on Ontoserver. tx.fhir.org
+defaults to 2.82 and rejects a 2.83 lookup with 422; that response does not trigger
+failover. Its negative 2.83 validation echoes the requested version even though
+the release is unavailable. The adapter retains that native result in a 409
+verification error instead of reporting the echoed release as observed.
+Some named ValueSets lack historical versions; see the
+[provider's collection and version restrictions](https://loinc.org/kb/api/fhir/valueset).
+
+`_meta.loinc_version` (or `loinc_versions` for multiple reported releases) is
+derived from the returned CodeSystem/lookup or expansion evidence.
+ValueSet, ConceptMap and Questionnaire versions are separate: their full resources
+retain `version`, and direct resources also expose `_meta.resource_version`.
+`_meta.requested_versions` records inputs, not observed releases. ConceptMap group
+source/target versions and equivalence are preserved; a map release does not
+establish the target terminology release. The provider documents its SNOMED maps
+as historical; see [ConceptMap coverage](https://loinc.org/kb/api/fhir/conceptmap).
+
+Full FHIR envelopes retain pagination, expansion parameters, designations, nested
+Questionnaire items, contained answer lists and skip logic. Responses over 30 KiB
+stage through the shared data tools, including large composed results and errors.
+SQL projections retain `native_json`, source paths and parent paths; `response_context`
+keeps root metadata, pagination and expansion totals. Questionnaire item and contained
+resource tables are covered by fixtures; positive licensed native data remains pending.
+Responses over 2 MiB, partial HTTP bodies, invalid UTF-8 and bodies stalled beyond
+15 seconds fail explicitly. Bounded native error bodies remain recoverable rather
+than being sliced to a short diagnostic. Recipes return staging/error handles intact. Both
+the usual tool names and their `mcp_` aliases are registered.
+
+### Native acceptance — October 4, 2026
+
+- Ontoserver lists 12 LOINC CodeSystem versions; tx.fhir.org lists 2. Native lookup
+  properties and designations survive both inline and staged MCP responses.
+- A creatinine expansion on Ontoserver reports 4,011 matches. The bounded 500-term
+  page and offset continuation preserve total, version evidence and partial-coverage
+  metadata. tx.fhir.org's tested expansion omits a total; the server does not invent one.
+- Both mirrors expand answer list `LL1162-8`. Tested group `LG51018-6` expansion is
+  unavailable, and the tested 2.83 ChEBI ConceptMap search returns an empty Bundle.
+  Neither result establishes complete LOINC collection or mapping coverage.
+- Both 2.82/2.83 Questionnaire searches and the tested detail fail on public mirrors
+  (tx.fhir.org 404; Ontoserver 400). The licensed endpoint returns 401 without credentials.
+  Positive historical Questionnaire and licensed group/map acceptance remain pending.
+- Code validation uses the [FHIR R4 type-level `url` parameter](https://hl7.org/fhir/R4/codesystem-operation-validate-code.html).
+  A valid code does not by itself establish active status; retain native `result` and issues.
+
+Native receipts, full MCP proof/recovery checks and validation logs are recorded in
+`scratch/2026-10-04-loinc/`. These are bounded local acceptance checks, not a deployment
+or exhaustive release/terminology coverage claim.
+
+### Historical keyless observations
 
 **What the keyless tier serves:** the full LOINC CodeSystem (2.82 as of
 2026-08-27 on both mirrors) — `$lookup`, `$validate-code`, `$subsumes`,
@@ -121,8 +205,9 @@ answered a given call.
 ### Shared-package dependency
 
 `src/lib/http.ts` passes `deadlineMs` to `restFetch`, which gives each endpoint
-a bounded slice of the isolate's 30 s budget so the failover candidate still
-gets a turn. `deadlineMs` is a `@bio-mcp/shared` option. Servers resolve
+a bounded per-endpoint budget (12 s with failover; 30 s for a pinned endpoint)
+so the failover candidate still gets a turn. Code Mode allows 90 s for execution
+and staging. `deadlineMs` is a `@bio-mcp/shared` option. Servers resolve
 `@bio-mcp/shared` to `dist/`, so **run `pnpm --filter @bio-mcp/shared run build`
 before deploying this server**; a stale `dist` ignores the option silently and
 each endpoint can burn its full retry budget instead of failing over in time.
@@ -158,3 +243,13 @@ See [`docs/adding-mcp-servers.md`](../../docs/adding-mcp-servers.md) and the roo
 ---
 
 *Auto-generated baseline README — refine with server-specific detail as needed.*
+
+<!-- license-and-data-terms:start -->
+## License and data terms
+
+The code in this repository is licensed under the Apache License 2.0 (see `LICENSE`).
+If you use it in your work, please cite it (see `CITATION.cff`). Citation is requested, not required.
+
+The license covers the code only. Data that this server returns comes from LOINC (FHIR terminology) and stays under the terms of that source: Free incl. commercial; attribution, no modification, no competing standard.
+You are responsible for your use of the data under those terms.
+<!-- license-and-data-terms:end -->

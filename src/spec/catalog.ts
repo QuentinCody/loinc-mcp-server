@@ -1,8 +1,9 @@
 import type { ApiCatalog, ApiEndpoint } from "@bio-mcp/shared/codemode/catalog";
 import type { LoincEndpoint } from "../lib/http";
+import { releaseEndpoints, releaseWorkflowsFor } from "./releases";
 
 const SHARED_NOTES =
-    "- LOINC = Logical Observation Identifiers Names and Codes (99K+ observation/lab codes)\n" +
+    "- LOINC = Logical Observation Identifiers Names and Codes\n" +
     "- FHIR R4 format. Responses are application/fhir+json\n" +
     "- Code format: numeric with optional dash (e.g., 2160-0 for Creatinine, 718-7 for Hemoglobin)\n" +
     "- LOINC 6-part name axes: Component, Property, Time, System, Scale, Method\n" +
@@ -12,12 +13,15 @@ const SHARED_NOTES =
     "- Bundle resources contain entry[] arrays for search results\n" +
     "- system parameter is always http://loinc.org for LOINC codes\n" +
     "- Every result carries _meta.loinc_tier (which upstream answered), _meta.loinc_base_url\n" +
-    "  and, when the server reports one, _meta.loinc_version (the LOINC release)";
+    "  and, when established, _meta.loinc_version (the LOINC CodeSystem release). Resource versions are separate.\n" +
+    "- Provider service docs advertise 2.83 and historical selection. Use version for CodeSystem lookup/resource searches, valueSetVersion for ValueSet reads; do not replace these with version-suffixed canonical URIs. Pins reject missing/mismatched returned versions.\n" +
+    "- upstream explicitly selects primary, tx.fhir.org or ontoserver from the configured endpoint set. A selection disables failover for that call; an override/credential configuration cannot be escaped. Default 4xx responses never fall through to a different host.\n" +
+    "- FHIR pages/resources do not establish all-version coverage. Keep Bundle links, expansion total/offset/parameters and the answering host; an empty search does not prove that a release or resource is globally unavailable.";
 
 const KEYLESS_NOTES =
     "- ACTIVE TIER: keyless. No LOINC credential is configured, so this server reads the LOINC\n" +
     "  CodeSystem from the public HL7 (tx.fhir.org/r4) primary and the CSIRO\n" +
-    "  (r4.ontoserver.csiro.au/fhir) failover. Both serve LOINC 2.82\n" +
+    "  (r4.ontoserver.csiro.au/fhir) failover. On 2026-10-04 tx.fhir.org returned 2.82 and rejected 2.83; Ontoserver returned 2.83 and also served pinned 2.82. Select upstream: ontoserver explicitly for the 2.83 lookup recipe.\n" +
     "- THE TWO MIRRORS DIFFER. Measured 2026-08-27, $lookup of 2160-0 with property=*:\n" +
     "  tx.fhir.org returned 25 property parts over 15 distinct codes (COMPONENT, PROPERTY,\n" +
     "  TIME_ASPCT, SYSTEM, SCALE_TYP, CLASS, CLASSTYPE, STATUS, ORDER_OBS, parent, inactive,\n" +
@@ -54,11 +58,13 @@ function tierNotes(endpoint: LoincEndpoint): string {
  */
 const KEYLESS_GAPS: Record<string, string> = {
     "/ConceptMap":
-        "DEGRADED without LOINC credentials: neither keyless server indexes LOINC ConceptMaps (tx.fhir.org errors, Ontoserver rejects the search).",
+        "DEGRADED: October 4, 2026 both keyless mirrors return an empty Bundle for the 2.83 LOINC–ChEBI map. This does not establish licensed map absence or availability in other releases.",
     "/ConceptMap/$translate":
         "DEGRADED without LOINC credentials: both mirrors answer HTTP 200 with result=false - tx.fhir.org says 'No ConceptMap is available to translate from http://loinc.org', Ontoserver says 'No mappings could be found'. The LOINC/SNOMED cooperative maps are not loaded on either keyless server.",
     "/ValueSet":
-        "DEGRADED without LOINC credentials: searching by the loinc.org/vs canonical does not reach the LOINC answer-list catalogue on either mirror - tx.fhir.org returns a Bundle with total 0, Ontoserver returns total 1 (only http://loinc.org/2.82/vs, the all-codes value set). Expand a known answer-list URL via ValueSet/$expand instead.",
+        "DEGRADED without LOINC credentials: searching by the loinc.org/vs canonical does not reach the LOINC answer-list catalogue on either mirror - tx.fhir.org returns a Bundle with total 0, Ontoserver returns total 1 (only http://loinc.org/2.83/vs, the all-codes value set, on October 4, 2026). Expand a known answer-list URL via ValueSet/$expand instead.",
+    "/Questionnaire": "DEGRADED: October 4, 2026 tx.fhir.org returns 404 and Ontoserver returns unsupported-operation 400 for both 2.82 and 2.83 examples. Licensed historical Questionnaire acceptance remains unverified.",
+    "/Questionnaire/{id}": "DEGRADED: neither keyless mirror serves the tested native Questionnaire detail route; licensed access is required for provider-supported panels.",
 };
 
 function withTierWarnings(
@@ -73,6 +79,7 @@ function withTierWarnings(
 }
 
 const ENDPOINTS: ApiEndpoint[] = [
+    ...releaseEndpoints,
     // ---- code_lookup ----
     {
         method: "GET",
@@ -82,17 +89,19 @@ const ENDPOINTS: ApiEndpoint[] = [
         queryParams: [
             { name: "system", type: "string", required: true, description: "Code system URL (use http://loinc.org)" },
             { name: "code", type: "string", required: true, description: "LOINC code (e.g. 2160-0 for Creatinine)" },
+            { name: "version", type: "string", required: false, description: "Explicit LOINC release, e.g. 2.83; lookup requires the responding host to report the same version" },
             { name: "property", type: "string", required: false, description: "Specific property to return (use * for all properties)" },
         ],
     },
     {
         method: "GET",
         path: "/CodeSystem/$validate-code",
-        summary: "Validate whether a LOINC code exists and is active",
+        summary: "Validate a LOINC code and optional display. Read result and issues; this does not establish active status. A version pin requires positive validation with the same reported release; otherwise the full native result is retained in a verification error.",
         category: "validation",
         queryParams: [
-            { name: "system", type: "string", required: true, description: "Code system URL (use http://loinc.org)" },
+            { name: "url", type: "string", required: true, description: "CodeSystem canonical URL (http://loinc.org); legacy system is normalized to url and must agree if both are supplied" },
             { name: "code", type: "string", required: true, description: "LOINC code to validate" },
+            { name: "version", type: "string", required: false, description: "Explicit release; a negative validation alone cannot establish this pin" },
             { name: "display", type: "string", required: false, description: "Display name to validate against the code" },
         ],
     },
@@ -115,6 +124,9 @@ const ENDPOINTS: ApiEndpoint[] = [
         category: "value_sets",
         queryParams: [
             { name: "url", type: "string", required: false, description: "Value set URL (e.g. http://loinc.org/vs/LL1000-0 for an answer list, or http://loinc.org/vs for all of LOINC)" },
+            { name: "valueSetVersion", type: "string", required: false, description: "Explicit ValueSet definition version, e.g. 2.83; not automatically the underlying code-system version" },
+            { name: "system-version", type: "string", required: false, description: "Requested LOINC CodeSystem release, http://loinc.org|2.83; this adapter requires matching observed expansion evidence" },
+            { name: "check-system-version", type: "string", required: false, description: "Require a LOINC CodeSystem release, http://loinc.org|2.83; response must establish it independently of an echoed request" },
             { name: "filter", type: "string", required: false, description: "Text filter to search for matching codes (e.g. 'creatinine', 'hemoglobin')" },
             { name: "count", type: "number", required: false, description: "Maximum number of codes to return" },
             { name: "offset", type: "number", required: false, description: "Starting offset for pagination" },
@@ -127,6 +139,7 @@ const ENDPOINTS: ApiEndpoint[] = [
         category: "value_sets",
         queryParams: [
             { name: "url", type: "string", required: false, description: "Filter by value set URL" },
+            { name: "valueSetVersion", type: "string", required: false, description: "Provider ValueSet definition version; every returned resource must match" },
             { name: "name", type: "string", required: false, description: "Filter by value set name" },
             { name: "_count", type: "number", required: false, description: "Maximum number of results" },
         ],
@@ -138,6 +151,8 @@ const ENDPOINTS: ApiEndpoint[] = [
         summary: "Search for concept maps (mappings between LOINC and other code systems like SNOMED CT)",
         category: "mappings",
         queryParams: [
+            { name: "url", type: "string", required: false, description: "Canonical ConceptMap URL, e.g. http://loinc.org/cm/loinc-parts-to-chebi" },
+            { name: "version", type: "string", required: false, description: "Explicit ConceptMap version, e.g. 2.83; map version is distinct from target terminology versions" },
             { name: "source", type: "string", required: false, description: "Source code system URL (e.g. http://loinc.org to find maps FROM LOINC)" },
             { name: "target", type: "string", required: false, description: "Target code system URL (e.g. http://loinc.org to find maps TO LOINC)" },
             { name: "_count", type: "number", required: false, description: "Maximum number of results" },
@@ -162,6 +177,8 @@ const ENDPOINTS: ApiEndpoint[] = [
         category: "metadata",
         queryParams: [
             { name: "url", type: "string", required: false, description: "CodeSystem URL (use http://loinc.org)" },
+            { name: "version", type: "string", required: false, description: "Select a CodeSystem release, e.g. 2.83; an empty Bundle does not establish availability" },
+            { name: "_count", type: "number", required: false, description: "FHIR search page size; retain Bundle links/total" },
         ],
     },
     {
@@ -188,6 +205,10 @@ export function loincCatalogFor(endpoint: LoincEndpoint): ApiCatalog {
             : "http_basic",
         endpointCount: ENDPOINTS.length,
         notes: `${SHARED_NOTES}\n${tierNotes(endpoint)}`,
-        endpoints: withTierWarnings(ENDPOINTS, keyless),
+        endpoints: withTierWarnings(ENDPOINTS, keyless).map(endpoint => ({ ...endpoint, queryParams: [
+            ...(endpoint.queryParams ?? []), { name: "upstream", type: "string", required: false,
+                description: "Explicitly select primary, tx.fhir.org or ontoserver from the configured endpoint set. Omit for normal failover; never sent upstream." },
+        ] })),
+        workflows: releaseWorkflowsFor(keyless),
     };
 }
